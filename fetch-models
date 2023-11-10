@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODELS_URL="https://raw.githubusercontent.com/nomic-ai/gpt4all/main/gpt4all-chat/metadata/models.json" 
+
+main() {
+	require jq curl
+
+	if [[ ! $GPT4ALL_MODELS ]]; then
+		log "GPT4ALL_MODELS is not set. Are you in the Nix shell?"
+		exit 1
+	fi
+	
+	MODELS_PATH="$GPT4ALL_MODELS/models.json"
+	if [[ ! -f "$MODELS_PATH" ]]; then
+		log "Downloading models list to $MODELS_PATH"
+		curl -s "$MODELS_URL" > "$MODELS_PATH"
+	fi
+
+	readarray -t modelNames \
+		< <(jq -r '.[] | select(.url != null) | .name' "$MODELS_PATH")
+	readarray -t modelSizes \
+		< <(jq -r '.[] | select(.url != null) | .filesize' "$MODELS_PATH")
+	readarray -t modelURLs \
+		< <(jq -r '.[] | select(.url != null) | .url' "$MODELS_PATH")
+	readarray -t modelMD5s \
+		< <(jq -r '.[] | select(.url != null) | .md5sum' "$MODELS_PATH")
+
+	modelDownloaded=()
+	for ((i = 0; i < ${#modelNames[@]}; i++)); do
+		modelName="$(basename "${modelURLs[$i]}")"
+		if [[ -f "$GPT4ALL_MODELS/$modelName" ]]; then
+			modelDownloaded+=("(downloaded)")
+			continue
+		fi
+		modelDownloaded+=("")
+	done
+
+	echo "Enter the numbers of the models you want to download, separated by spaces."
+	echo "e.g. 0 2 12"
+	echo
+	for ((i = 0; i < ${#modelNames[@]}; i++)); do
+		printf "%2d: %-20s (~%s) %s\n" \
+			"$i" \
+			"${modelNames[i]}" \
+			"$(sizeString "${modelSizes[i]}")" \
+			"${modelDownloaded[i]}"
+	done
+	echo
+
+	read -r -p "> " -a modelNumbers
+
+	downloadingURLs=()
+	for i in "${modelNumbers[@]}"; do
+		modelURL="${modelURLs[$i]}"
+		if [[ ! $modelURL ]]; then
+			log "Invalid model number $i"
+			exit 1
+		fi
+
+		downloadingURLs+=("$modelURL")
+	done
+
+	bulkDownload \
+		"$GPT4ALL_MODELS" \
+		"${downloadingURLs[@]}"
+}
+
+log() {
+	echo "$@" >&2
+}
+
+sizeString() {
+	local size="$1"
+	local unit="B"
+	if ((size > 1024)); then
+		size=$((size / 1024))
+		unit="KB"
+	fi
+	if ((size > 1024)); then
+		size=$((size / 1024))
+		unit="MB"
+	fi
+	if ((size > 1024)); then
+		size=$((size / 1024))
+		unit="GB"
+	fi
+	echo "$size$unit"
+}
+
+bulkDownload() {
+	dest="$1"
+	urls=("${@:2}")
+
+	if ! command -v aria2c &> /dev/null; then
+		log "aria2c not found, falling back to curl"
+		for url in "${urls[@]}"; do
+			log "Downloading $url..."
+			curl "$url" > "$dest/.tmp.$(basename "$url")"
+		done
+	else
+		# Craft the aria2c input file.
+		aria2cInput=""
+		for url in "${urls[@]}"; do
+			aria2cInput+="$url"$'\n'
+			aria2cInput+="  out=.tmp.$(basename "$url")"$'\n'
+		done
+		aria2c -d "$dest" -i - <<< "$aria2cInput"
+	fi
+
+	for url in "${urls[@]}"; do
+		filename=".tmp.$(basename "$url")"
+		if [[ ! -f "$dest/$filename" ]]; then
+			log "Download of $url failed. Aborting."
+			exit 1
+		fi
+		mv "$dest/$filename" "$dest/$(basename "$url")"
+	done
+}
+
+require() {
+	for cmd in "$@"; do
+		if ! command -v "$cmd" &> /dev/null; then
+			log "Command $cmd is required, but not found. Aborting." >&2
+			exit 1
+		fi
+	done
+}
+
+main "$@"
